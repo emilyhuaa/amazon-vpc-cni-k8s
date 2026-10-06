@@ -62,6 +62,10 @@ type metricsAction struct {
 type dataPoints struct {
 	lastSingleDataPoint float64
 	curSingleDataPoint  float64
+	// Counters are cumulative per target, so deltas must be taken per target
+	// before being summed across the cluster.
+	targetSample float64
+	lastByTarget map[string]float64
 }
 
 type bucketPoint struct {
@@ -108,7 +112,7 @@ func processGauge(metric *dto.Metric, act *metricsAction) {
 }
 
 func processCounter(metric *dto.Metric, act *metricsAction) {
-	act.actionFunc(&act.data.curSingleDataPoint, metric.GetCounter().GetValue())
+	act.actionFunc(&act.data.targetSample, metric.GetCounter().GetValue())
 }
 
 func processPercentile(metric *dto.Metric, act *metricsAction) {
@@ -151,35 +155,53 @@ func processHistogram(metric *dto.Metric, act *metricsAction, log logger.Logger)
 	}
 }
 
-func postProcessingCounter(convert metricsConvert, log logger.Logger) bool {
+// postProcessingCounter folds one target's counter sample into the cluster total as
+// the delta since that target's previous sample. A first sample or a restarted
+// counter (value went down) contributes its whole value and is reported as a reset.
+func postProcessingCounter(convert metricsConvert, target string, log logger.Logger) bool {
 	resetDetected := false
-	noPreviousDataPoint := true
-	noCurrentDataPoint := true
 	for _, action := range convert.actions {
-		currentTotal := action.data.curSingleDataPoint
-		// Only do delta if metric target did NOT restart
-		if action.data.curSingleDataPoint < action.data.lastSingleDataPoint {
+		sample := action.data.targetSample
+		action.data.targetSample = 0
+		if action.data.lastByTarget == nil {
+			action.data.lastByTarget = make(map[string]float64)
+		}
+
+		last, seen := action.data.lastByTarget[target]
+		if !seen || sample < last {
 			resetDetected = true
+			action.data.curSingleDataPoint += sample
 		} else {
-			action.data.curSingleDataPoint -= action.data.lastSingleDataPoint
+			action.data.curSingleDataPoint += sample - last
 		}
-
-		if action.data.lastSingleDataPoint != 0 {
-			noPreviousDataPoint = false
-		}
-
-		if action.data.curSingleDataPoint != 0 {
-			noCurrentDataPoint = false
-		}
-
-		action.data.lastSingleDataPoint = currentTotal
+		action.data.lastByTarget[target] = sample
 	}
 
-	if resetDetected || (noPreviousDataPoint && !noCurrentDataPoint) {
-		log.Debugf("Reset detected resetDetected: %v, noPreviousDataPoint: %v, noCurrentDataPoint: %v",
-			resetDetected, noPreviousDataPoint, noCurrentDataPoint)
+	if resetDetected {
+		log.Debugf("Reset detected for counter target %s", target)
 	}
-	return resetDetected || (noPreviousDataPoint && !noCurrentDataPoint)
+	return resetDetected
+}
+
+// pruneCounterTargets drops per-target counter state for targets that are gone,
+// so a replaced aws-node pod does not keep a stale baseline forever.
+func pruneCounterTargets(interestingMetrics map[string]metricsConvert, targets []string) {
+	live := make(map[string]struct{}, len(targets))
+	for _, t := range targets {
+		live[t] = struct{}{}
+	}
+	for _, convert := range interestingMetrics {
+		for _, act := range convert.actions {
+			if act.data == nil {
+				continue
+			}
+			for t := range act.data.lastByTarget {
+				if _, ok := live[t]; !ok {
+					delete(act.data.lastByTarget, t)
+				}
+			}
+		}
+	}
 }
 
 func postProcessingHistogram(convert metricsConvert, log logger.Logger) bool {
@@ -239,7 +261,7 @@ func postProcessingHistogram(convert metricsConvert, log logger.Logger) bool {
 	return resetDetected || noLastBucket
 }
 
-func processMetric(family *dto.MetricFamily, convert metricsConvert, log logger.Logger) (bool, error) {
+func processMetric(family *dto.MetricFamily, convert metricsConvert, target string, log logger.Logger) (bool, error) {
 	resetDetected := false
 
 	metricType := family.GetType()
@@ -262,7 +284,7 @@ func processMetric(family *dto.MetricFamily, convert metricsConvert, log logger.
 
 	switch metricType {
 	case dto.MetricType_COUNTER:
-		curResetDetected := postProcessingCounter(convert, log)
+		curResetDetected := postProcessingCounter(convert, target, log)
 		if curResetDetected {
 			resetDetected = true
 		}
@@ -427,7 +449,7 @@ func metricsListGrabAggregateConvert(ctx context.Context, t metricsTarget) (map[
 
 		for _, family := range families {
 			convert := interestingMetrics[family.GetName()]
-			curReset, err := processMetric(family, convert, t.getLogger())
+			curReset, err := processMetric(family, convert, target, t.getLogger())
 			if err != nil {
 				return nil, nil, true, err
 			}
@@ -436,6 +458,8 @@ func metricsListGrabAggregateConvert(ctx context.Context, t metricsTarget) (map[
 			}
 		}
 	}
+
+	pruneCounterTargets(interestingMetrics, targetList)
 
 	// TODO resetDetected is NOT right for cniMetrics, so force it for now
 	if len(targetList) > 1 {
